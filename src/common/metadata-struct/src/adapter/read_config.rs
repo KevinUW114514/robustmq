@@ -11,3 +11,18 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+#[derive(Default, Clone)]
+pub struct ReadConfig {
+    pub max_record_num: u64,
+    pub max_size: u64,
+}
+
+impl ReadConfig {
+    pub fn new() -> Self {
+        ReadConfig {
+            max_record_num: 10,
+            max_size: 1024 * 1024 * 1024,
+        }
+    }
+}

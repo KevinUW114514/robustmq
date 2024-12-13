@@ -217,11 +217,6 @@ impl CacheManager {
         }
     }
 
-    pub fn remove_filter_by_client_id(&self, client_id: String) {
-        self.subscribe_filter.remove(&client_id);
-        self.subscribe_is_new.remove(&client_id);
-    }
-
     pub fn get_session_info(&self, client_id: &str) -> Option<MqttSession> {
         if let Some(session) = self.session_info.get(client_id) {
             return Some(session.clone());
@@ -322,8 +317,8 @@ impl CacheManager {
         self.topic_info.contains_key(topic)
     }
 
-    pub fn topic_name_by_id(&self, topic_id: String) -> Option<String> {
-        if let Some(data) = self.topic_id_name.get(&topic_id) {
+    pub fn topic_name_by_id(&self, topic_id: &str) -> Option<String> {
+        if let Some(data) = self.topic_id_name.get(topic_id) {
             return Some(data.clone());
         }
         None

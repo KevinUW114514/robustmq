@@ -19,20 +19,21 @@ use std::time::Duration;
 
 use common_base::tools::now_mills;
 use dashmap::DashMap;
-use log::{error, warn};
+use log::error;
 use metadata_struct::journal::segment::segment_name;
 use metadata_struct::journal::shard::shard_name_iden;
 use protocol::journal_server::journal_engine::{
     WriteReqBody, WriteReqMessages, WriteReqSegmentMessages,
 };
 use tokio::select;
-use tokio::sync::broadcast::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::time::{sleep, timeout};
 
 use crate::cache::{load_shards_cache, MetadataCache};
 use crate::connection::ConnectionManager;
 use crate::error::JournalClientError;
 use crate::service::batch_write;
+use crate::JournalClientWriteData;
 
 // Send Message Struct
 #[derive(Clone)]
@@ -40,9 +41,7 @@ pub struct SenderMessage {
     namespace: String,
     shard_name: String,
     segment: u32,
-    key: String,
-    content: Vec<u8>,
-    tags: Vec<String>,
+    data: Vec<JournalClientWriteData>,
 }
 
 impl SenderMessage {
@@ -50,39 +49,36 @@ impl SenderMessage {
         namespace: &String,
         shard_name: &String,
         segment: u32,
-        key: &String,
-        content: &Vec<u8>,
-        tags: &Vec<String>,
+        data: Vec<JournalClientWriteData>,
     ) -> Self {
         SenderMessage {
             namespace: namespace.to_owned(),
             shard_name: shard_name.to_owned(),
             segment,
-            key: key.to_owned(),
-            content: content.to_owned(),
-            tags: tags.to_owned(),
+            data,
         }
     }
 }
 
 // Send Message Resp Struct
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SenderMessageResp {
-    offset: u64,
-    error: Option<String>,
+    pub offset: u64,
+    pub error: Option<String>,
 }
 
 // Node Sender Threade Struct
 #[derive(Clone)]
 struct NodeSenderThread {
     node_send: Sender<DataSenderPkg>,
-    stop_send: broadcast::Sender<bool>,
+    stop_send: mpsc::Sender<bool>,
 }
 
 // Data Sender Pkg
 #[derive(Clone)]
 pub struct DataSenderPkg {
-    callback_sx: Sender<SenderMessageResp>,
+    sender_pkg_id: u64,
+    callback_sx: Sender<Vec<SenderMessageResp>>,
     message: SenderMessage,
 }
 
@@ -91,6 +87,7 @@ pub struct Writer {
     node_senders: DashMap<u64, NodeSenderThread>,
     connection_manager: Arc<ConnectionManager>,
     metadata_cache: Arc<MetadataCache>,
+    send_pkid_generator: AtomicU64,
 }
 
 impl Writer {
@@ -99,16 +96,18 @@ impl Writer {
         metadata_cache: Arc<MetadataCache>,
     ) -> Self {
         let node_senders = DashMap::with_capacity(2);
+        let send_pkid_generator = AtomicU64::new(0);
         Writer {
             node_senders,
             connection_manager,
             metadata_cache,
+            send_pkid_generator,
         }
     }
 
     fn add_node_sender(&self, node_id: u64) -> Sender<DataSenderPkg> {
-        let (data_sender, _) = broadcast::channel::<DataSenderPkg>(1000);
-        let (stop_send, _) = broadcast::channel::<bool>(1);
+        let (data_sender, data_recv) = mpsc::channel::<DataSenderPkg>(1000);
+        let (stop_send, stop_recv) = mpsc::channel::<bool>(1);
 
         let node_sender_thread = NodeSenderThread {
             node_send: data_sender.clone(),
@@ -121,16 +120,16 @@ impl Writer {
             node_id,
             self.connection_manager.clone(),
             self.metadata_cache.clone(),
-            data_sender.clone(),
-            stop_send,
+            data_recv,
+            stop_recv,
         );
 
         data_sender
     }
 
-    pub fn remove_node_sender(&self, node_id: u64) {
+    pub async fn remove_node_sender(&self, node_id: u64) {
         if let Some(node) = self.node_senders.get(&node_id) {
-            if let Ok(e) = node.stop_send.send(true) {
+            if let Ok(e) = node.stop_send.send(true).await {
                 self.node_senders.remove(&node_id);
             }
         }
@@ -139,7 +138,7 @@ impl Writer {
     pub async fn send(
         &self,
         message: &SenderMessage,
-    ) -> Result<SenderMessageResp, JournalClientError> {
+    ) -> Result<Vec<SenderMessageResp>, JournalClientError> {
         let active_segment_leader = if let Some(segment) = self
             .metadata_cache
             .get_segment_leader(&message.namespace, &message.shard_name)
@@ -172,20 +171,23 @@ impl Writer {
             self.add_node_sender(active_segment_leader)
         };
 
-        let (callback_sx, mut callback_rx) = broadcast::channel::<SenderMessageResp>(2);
+        let (callback_sx, mut callback_rx) = mpsc::channel::<Vec<SenderMessageResp>>(2);
         let data = DataSenderPkg {
+            sender_pkg_id: self
+                .send_pkid_generator
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             callback_sx,
             message: message.to_owned(),
         };
 
-        let rs = sender.send(data);
+        let rs = sender.send(data).await;
         let resp_data = timeout(Duration::from_secs(30), callback_rx.recv()).await?;
-        Ok(resp_data?)
+        Ok(resp_data.unwrap())
     }
 
     pub async fn close(&self) -> Result<(), JournalClientError> {
         for raw in self.node_senders.iter() {
-            raw.value().stop_send.send(true)?;
+            raw.value().stop_send.send(true).await?;
         }
         Ok(())
     }
@@ -195,21 +197,20 @@ pub fn start_sender_thread(
     node_id: u64,
     connection_manager: Arc<ConnectionManager>,
     metadata_cache: Arc<MetadataCache>,
-    node_send: Sender<DataSenderPkg>,
-    stop_send: broadcast::Sender<bool>,
+    mut node_recv: Receiver<DataSenderPkg>,
+    mut stop_recv: Receiver<bool>,
 ) {
     tokio::spawn(async move {
-        let mut stop_recv = stop_send.subscribe();
-        let mut node_recv = node_send.subscribe();
         let pkid_generator = AtomicU64::new(0);
+
         loop {
             select! {
                 val = stop_recv.recv()=>{
-                    if let Err(flag) = val {
+                    if let Some(flag) = val {
 
                     }
                 },
-                messages = get_batch_message(&mut node_recv, 10)=>{
+                messages = get_batch_message(&mut node_recv, 100)=>{
                     if messages.is_empty(){
                         sleep(Duration::from_millis(100)).await;
                         continue;
@@ -227,6 +228,76 @@ async fn batch_sender_message(
     node_id: u64,
     pkid_generator: &AtomicU64,
     messages: Vec<DataSenderPkg>,
+) {
+    let (segments, data_pkgs, callback_sx) = build_send_data(pkid_generator, messages);
+
+    // send data
+    let body = WriteReqBody { data: segments };
+    match batch_write(connection_manager, node_id, body).await {
+        Ok(data) => {
+            // callback resp
+            let mut pkid_resp = HashMap::new();
+            for shard_msg in data.status {
+                for msg in shard_msg.messages {
+                    let resp = if let Some(e) = msg.error {
+                        SenderMessageResp {
+                            error: Some(format!("{}:{}", e.code, e.error)),
+                            ..Default::default()
+                        }
+                    } else {
+                        SenderMessageResp {
+                            offset: msg.offset,
+                            error: None,
+                        }
+                    };
+                    pkid_resp.insert(msg.pkid, resp);
+                }
+            }
+
+            for (id, pkids) in data_pkgs {
+                let mut results = Vec::new();
+                for pkid in pkids {
+                    if let Some(resp) = pkid_resp.get(&pkid) {
+                        results.push(resp.to_owned());
+                    }
+                }
+
+                if let Some(sx) = callback_sx.get(&id) {
+                    if let Err(e) = sx.send(results).await {
+                        error!("{}", e);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            // callback error
+            for (id, pkids) in data_pkgs {
+                let mut results = Vec::new();
+                for pkid in pkids {
+                    results.push(SenderMessageResp {
+                        error: Some(e.to_string()),
+                        ..Default::default()
+                    });
+                }
+
+                if let Some(sx) = callback_sx.get(&id) {
+                    if let Err(e) = sx.send(results).await {
+                        error!("{}", e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn build_send_data(
+    pkid_generator: &AtomicU64,
+    messages: Vec<DataSenderPkg>,
+) -> (
+    Vec<WriteReqSegmentMessages>,
+    DashMap<u64, Vec<u64>>,
+    DashMap<u64, Sender<Vec<SenderMessageResp>>>,
 ) {
     // build data by namespace&shard_name&segment
     let mut segment_data_list: HashMap<String, Vec<DataSenderPkg>> = HashMap::new();
@@ -246,7 +317,8 @@ async fn batch_sender_message(
 
     // build WriteReqSegmentMessages
     let mut segments: Vec<WriteReqSegmentMessages> = Vec::new();
-    let mut callback_sender = HashMap::new();
+    let data_pkgs: DashMap<u64, Vec<u64>> = DashMap::with_capacity(2);
+    let callback_sx: DashMap<u64, Sender<Vec<SenderMessageResp>>> = DashMap::with_capacity(2);
     for (_, messages) in segment_data_list {
         if messages.is_empty() {
             continue;
@@ -257,15 +329,23 @@ async fn batch_sender_message(
         let segment = first_msg.message.segment;
 
         let mut write_req_segment_messages = Vec::new();
+
         for msg in messages {
-            let pkid = pkid_generator.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            write_req_segment_messages.push(WriteReqMessages {
-                pkid,
-                key: msg.message.key,
-                value: msg.message.content,
-                tags: msg.message.tags,
-            });
-            callback_sender.insert(pkid, msg.callback_sx);
+            for (i, raw) in msg.message.data.iter().enumerate() {
+                let pkid = pkid_generator.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                write_req_segment_messages.push(WriteReqMessages {
+                    pkid,
+                    key: raw.key.to_owned(),
+                    value: raw.content.to_owned(),
+                    tags: raw.tags.to_owned(),
+                });
+                if let Some(mut data_mut) = data_pkgs.get_mut(&msg.sender_pkg_id) {
+                    data_mut.push(pkid);
+                } else {
+                    data_pkgs.insert(msg.sender_pkg_id, vec![pkid]);
+                }
+            }
+            callback_sx.insert(msg.sender_pkg_id, msg.callback_sx);
         }
 
         let msg = WriteReqSegmentMessages {
@@ -276,47 +356,7 @@ async fn batch_sender_message(
         };
         segments.push(msg);
     }
-
-    // send data
-    let body = WriteReqBody { data: segments };
-    match batch_write(connection_manager, node_id, body).await {
-        Ok(data) => {
-            // callback resp
-            for shard_msg in data.status {
-                for msg in shard_msg.messages {
-                    if let Some(callback_sx) = callback_sender.get(&msg.pkid) {
-                        let resp = if let Some(e) = msg.error {
-                            SenderMessageResp {
-                                offset: 0,
-                                error: Some(format!("{}:{}", e.code, e.error)),
-                            }
-                        } else {
-                            SenderMessageResp {
-                                offset: msg.offset,
-                                error: None,
-                            }
-                        };
-                        if let Err(e) = callback_sx.send(resp) {
-                            error!("{}", e);
-                        }
-                    } else {
-                        warn!("");
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            // callback error
-            for (_, callback_sx) in callback_sender {
-                if let Err(e) = callback_sx.send(SenderMessageResp {
-                    offset: 0,
-                    error: Some(e.to_string()),
-                }) {
-                    error!("{}", e);
-                }
-            }
-        }
-    }
+    (segments, data_pkgs, callback_sx)
 }
 
 // Fetching data in bulk
@@ -329,7 +369,7 @@ async fn get_batch_message(recv: &mut Receiver<DataSenderPkg>, line_ms: u64) -> 
         }
 
         let data = timeout(Duration::from_millis(2), recv.recv()).await;
-        if let Ok(Ok(data_1)) = data {
+        if let Ok(Some(data_1)) = data {
             results.push(data_1);
             continue;
         }

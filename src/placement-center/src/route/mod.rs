@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bincode::{deserialize, serialize};
+use common_base::utils::vec_util;
 use data::{StorageData, StorageDataType};
 use log::{error, info};
 
@@ -113,6 +114,14 @@ impl DataRoute {
                     .delete_idempotent_data(storage_data.value)?;
                 Ok(None)
             }
+            StorageDataType::ClusterSaveOffset => {
+                self.route_cluster.save_offset_data(storage_data.value)?;
+                Ok(None)
+            }
+            StorageDataType::ClusterDeleteOffset => {
+                self.route_cluster.delete_offset_data(storage_data.value)?;
+                Ok(None)
+            }
 
             // Journal Engine
             StorageDataType::JournalSetShard => Ok(Some(
@@ -191,6 +200,14 @@ impl DataRoute {
             }
             StorageDataType::MqttSaveLastWillMessage => {
                 self.route_mqtt.save_last_will_message(storage_data.value)?;
+                Ok(None)
+            }
+            StorageDataType::MqttSetNxExclusiveTopic => {
+                let is_set = self.route_mqtt.set_nx_exclusive_topic(storage_data.value)?;
+                Ok(Some(vec_util::bool_to_vec(is_set)))
+            }
+            StorageDataType::MqttDeleteExclusiveTopic => {
+                self.route_mqtt.delete_exclusive_topic(storage_data.value)?;
                 Ok(None)
             }
         }

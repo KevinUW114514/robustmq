@@ -28,6 +28,9 @@ pub enum JournalClientError {
     #[error("{0}")]
     BroadcastSendErrorBool(#[from] tokio::sync::broadcast::error::SendError<bool>),
 
+    #[error("{0}")]
+    MpscSendErrorBool(#[from] tokio::sync::mpsc::error::SendError<bool>),
+
     #[error("Node {0} has no available access address, may be cache data inconsistency, ready to trigger update node cache.")]
     NodeNoAvailableAddr(u64),
 
@@ -60,4 +63,7 @@ pub enum JournalClientError {
 
     #[error("Shard {0} has no active segments")]
     NotActiveSegmentLeader(String),
+
+    #[error("The write request returns empty")]
+    WriteReqReturnTmpty,
 }

@@ -17,12 +17,12 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use common_base::error::common::CommonError;
+use inner::{PlacementServiceReply, PlacementServiceRequest};
 use journal::{JournalServiceReply, JournalServiceRequest};
 use kv::{KvServiceReply, KvServiceRequest};
 use lazy_static::lazy_static;
-use log::error;
+use log::debug;
 use mqtt::{MqttServiceReply, MqttServiceRequest};
-use placement::{PlacementServiceReply, PlacementServiceRequest};
 use tokio::time::sleep;
 
 use self::openraft::{OpenRaftServiceReply, OpenRaftServiceRequest};
@@ -66,6 +66,8 @@ pub enum PlacementCenterInterface {
     DeleteTopic,
     ListTopic,
     SetTopicRetainMessage,
+    SetNXExclusiveTopic,
+    DeleteExclusiveTopic,
     CreateSession,
     DeleteSession,
     ListSession,
@@ -148,12 +150,12 @@ impl PlacementCenterInterface {
     }
 }
 
+#[allow(clippy::module_inception)]
+pub mod inner;
 pub mod journal;
 pub mod kv;
 pub mod mqtt;
 pub mod openraft;
-#[allow(clippy::module_inception)]
-pub mod placement;
 
 fn is_write_request(_req: &PlacementCenterRequest) -> bool {
     true
@@ -191,7 +193,7 @@ async fn retry_placement_center_call<'a>(
                 return Ok(data);
             }
             Err(e) => {
-                error!("{}", e);
+                debug!("{}", e);
                 if times > retry_times() {
                     return Err(e);
                 }
@@ -214,7 +216,7 @@ async fn call_once(
             Ok(PlacementCenterReply::Kv(reply))
         }
         PlacementCenterRequest::Placement(request) => {
-            let reply = placement::call_placement_service_once(client_pool, addr, request).await?;
+            let reply = inner::call_placement_service_once(client_pool, addr, request).await?;
             Ok(PlacementCenterReply::Placement(reply))
         }
         PlacementCenterRequest::Journal(request) => {

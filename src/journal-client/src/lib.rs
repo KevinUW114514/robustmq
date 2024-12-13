@@ -21,6 +21,8 @@ use cache::{load_node_cache, load_shards_cache, start_update_cache_thread, Metad
 use connection::{start_conn_gc_thread, ConnectionManager};
 use error::JournalClientError;
 use log::error;
+use metadata_struct::adapter::read_config::ReadConfig;
+use metadata_struct::adapter::record::Record;
 use metadata_struct::journal::shard::shard_name_iden;
 use option::JournalClientOption;
 use protocol::journal_server::journal_engine::{CreateShardReqBody, DeleteShardReqBody};
@@ -32,12 +34,18 @@ use writer::{SenderMessage, SenderMessageResp, Writer};
 mod cache;
 mod connection;
 mod error;
-mod group;
 pub mod option;
 mod reader;
 mod service;
 pub mod tool;
 mod writer;
+
+#[derive(Default, Clone)]
+pub struct JournalClientWriteData {
+    pub key: String,
+    pub content: Vec<u8>,
+    pub tags: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct JournalEngineClient {
@@ -109,14 +117,12 @@ impl JournalEngineClient {
         Ok(())
     }
 
-    pub async fn send(
+    pub async fn batch_write(
         &self,
         namespace: String,
         shard_name: String,
-        key: String,
-        content: Vec<u8>,
-        tags: Vec<String>,
-    ) -> Result<SenderMessageResp, JournalClientError> {
+        data: Vec<JournalClientWriteData>,
+    ) -> Result<Vec<SenderMessageResp>, JournalClientError> {
         loop {
             let active_segment = if let Some(segment) = self
                 .metadata_cache
@@ -149,14 +155,8 @@ impl JournalEngineClient {
                 continue;
             };
 
-            let message = SenderMessage::build(
-                &namespace,
-                &shard_name,
-                active_segment,
-                &key,
-                &content,
-                &tags,
-            );
+            let message =
+                SenderMessage::build(&namespace, &shard_name, active_segment, data.clone());
             match self.writer.send(&message).await {
                 Ok(resp) => {
                     return Ok(resp);
@@ -173,13 +173,58 @@ impl JournalEngineClient {
         }
     }
 
-    pub async fn read_by_offset(&self, group_name: &str, namespace: &str, shard_name: &str) {}
+    pub async fn write(
+        &self,
+        namespace: String,
+        shard_name: String,
+        data: JournalClientWriteData,
+    ) -> Result<SenderMessageResp, JournalClientError> {
+        let resp_vec = self.batch_write(namespace, shard_name, vec![data]).await?;
+        if let Some(resp) = resp_vec.first() {
+            return Ok(resp.to_owned());
+        }
+        Err(JournalClientError::WriteReqReturnTmpty)
+    }
 
-    pub async fn read_by_timestamp(&self) {}
+    pub async fn read_by_offset(
+        &self,
+        namespace: &str,
+        shard_name: &str,
+        offset: u64,
+        read_config: &ReadConfig,
+    ) -> Result<Vec<Record>, JournalClientError> {
+        Ok(Vec::new())
+    }
 
-    pub async fn read_by_key(&self) {}
+    pub async fn read_by_key(
+        &self,
+        namespace: &str,
+        shard_name: &str,
+        key: &str,
+        read_config: &ReadConfig,
+    ) -> Result<Vec<Record>, JournalClientError> {
+        Ok(Vec::new())
+    }
 
-    pub async fn read_by_tag(&self) {}
+    pub async fn read_by_tag(
+        &self,
+        namespace: &str,
+        shard_name: &str,
+        offset: u64,
+        tag: &str,
+        read_config: &ReadConfig,
+    ) -> Result<Vec<Record>, JournalClientError> {
+        Ok(Vec::new())
+    }
+
+    pub async fn get_offset_by_timestamp(
+        &self,
+        namespace: &str,
+        shard_name: &str,
+        timestamp: u64,
+    ) -> Result<(u32, u64), JournalClientError> {
+        Ok((0, 0))
+    }
 
     pub async fn close(&self) -> Result<(), JournalClientError> {
         self.stop_send.send(true)?;

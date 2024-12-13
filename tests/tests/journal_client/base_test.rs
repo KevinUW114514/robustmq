@@ -19,10 +19,10 @@ mod tests {
     use protocol::journal_server::codec::{JournalEnginePacket, JournalServerCodec};
     use protocol::journal_server::journal_engine::{
         ApiKey, ApiVersion, CreateShardReq, CreateShardReqBody, DeleteShardReq, DeleteShardReqBody,
-        GetClusterMetadataReq, GetShardMetadataReq, GetShardMetadataReqBody,
-        GetShardMetadataReqShard, OffsetCommitReq, OffsetCommitReqBody, ReadReq, ReadReqBody,
-        ReadReqFilter, ReadReqMessage, ReadType, ReqHeader, WriteReq, WriteReqBody,
-        WriteReqMessages, WriteReqSegmentMessages,
+        FetchOffsetReq, FetchOffsetReqBody, GetClusterMetadataReq, GetShardMetadataReq,
+        GetShardMetadataReqBody, GetShardMetadataReqShard, ReadReq, ReadReqBody, ReadReqFilter,
+        ReadReqMessage, ReadType, ReqHeader, WriteReq, WriteReqBody, WriteReqMessages,
+        WriteReqSegmentMessages,
     };
     use tokio::net::TcpStream;
     use tokio_util::codec::Framed;
@@ -193,18 +193,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offset_base_test() {
+    async fn fetch_offset_test() {
         let socket = TcpStream::connect(&journal_tcp_addr()).await.unwrap();
         let mut stream = Framed::new(socket, JournalServerCodec::new());
 
-        let req_packet = JournalEnginePacket::OffsetCommitReq(OffsetCommitReq {
+        let req_packet = JournalEnginePacket::FetchOffsetReq(FetchOffsetReq {
             header: Some(ReqHeader {
-                api_key: ApiKey::OffsetCommit.into(),
+                api_key: ApiKey::Read.into(),
                 api_version: ApiVersion::V0.into(),
             }),
-            body: Some(OffsetCommitReqBody {
-                namespace: "n1".to_string(),
-                group: "g1".to_string(),
+            body: Some(FetchOffsetReqBody {
+                group_name: "g1".to_string(),
                 ..Default::default()
             }),
         });
